@@ -1,0 +1,15 @@
+[package]
+name = "netfault"
+version = "0.1.0"
+edition = "2021"
+description = "A TCP proxy that injects network faults for chaos/resilience testing"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

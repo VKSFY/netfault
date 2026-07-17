@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(git init *)",
+      "Bash(cargo init *)",
+      "Bash(ls c:/Users/oscar/.claude/projects/c--Users-oscar-Desktop-netfault/memory/ 2>&1)",
+      "Read(//c/Users/oscar/.claude/projects/c--Users-oscar-Desktop-netfault/memory/**)",
+      "Bash(ls c:/Users/oscar/.claude/projects/ 2>&1)",
+      "Read(//c/Users/oscar/.claude/projects/**)",
+      "Bash(cargo build *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo test *)",
+      "Bash(./target/release/netfault.exe)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git add *)",
+      "Bash(git -c user.email=claude@anthropic.com -c user.name=Claude commit -m 'M1: core tokio TCP proxy with tracing spans *)"
+    ]
+  }
+}
