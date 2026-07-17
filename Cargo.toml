@@ -10,6 +10,10 @@ tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macro
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

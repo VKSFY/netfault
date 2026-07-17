@@ -1,0 +1,17 @@
+# Example netfault configuration.
+# All fault fields default to a benign value (0 or 0.0) so partial configs are fine.
+
+listen = "127.0.0.1:8080"
+target = "127.0.0.1:9000"
+seed = 12345
+
+[client_to_server]
+latency_ms = 50
+latency_jitter_ms = 25
+drop_probability = 0.05
+corrupt_probability = 0.02
+corrupt_bits = 3
+close_probability = 0.001
+
+[server_to_client]
+latency_ms = 10

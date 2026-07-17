@@ -1,10 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tracing::{debug, error, info, info_span, warn, Instrument, Span};
+
+use crate::config::Config;
 
 const BUFFER_SIZE: usize = 8 * 1024;
 
@@ -26,12 +29,12 @@ impl Direction {
     }
 }
 
-/// Bind to `listen`, accept forever, and forward each connection to `target`.
-pub async fn run(listen: SocketAddr, target: SocketAddr) -> Result<()> {
-    let listener = TcpListener::bind(listen)
+/// Bind to `config.listen`, accept forever, and forward each connection to `config.target`.
+pub async fn run(config: Arc<Config>) -> Result<()> {
+    let listener = TcpListener::bind(config.listen)
         .await
-        .with_context(|| format!("failed to bind listener on {listen}"))?;
-    info!(%listen, %target, "netfault proxy listening");
+        .with_context(|| format!("failed to bind listener on {}", config.listen))?;
+    info!(listen = %config.listen, target = %config.target, "netfault proxy listening");
 
     loop {
         let (client, client_addr) = match listener.accept().await {
@@ -46,9 +49,10 @@ pub async fn run(listen: SocketAddr, target: SocketAddr) -> Result<()> {
 
         let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let span = info_span!("conn", id = id, client = %client_addr);
+        let conn_config = Arc::clone(&config);
         tokio::spawn(
             async move {
-                if let Err(err) = handle_connection(client, client_addr, target).await {
+                if let Err(err) = handle_connection(client, client_addr, conn_config).await {
                     warn!(error = %format!("{err:#}"), "connection ended with error");
                 }
             }
@@ -60,8 +64,9 @@ pub async fn run(listen: SocketAddr, target: SocketAddr) -> Result<()> {
 async fn handle_connection(
     client: TcpStream,
     client_addr: SocketAddr,
-    target: SocketAddr,
+    config: Arc<Config>,
 ) -> Result<()> {
+    let target = config.target;
     info!(%client_addr, %target, "connection opened");
 
     // Disable Nagle on the client side so small chunks flush promptly. This makes
