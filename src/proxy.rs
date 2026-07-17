@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, info_span, warn, Instrument, Span};
 
 use crate::config::{Config, FaultConfig};
@@ -35,51 +35,6 @@ impl Direction {
         match self {
             Direction::ClientToServer => 0,
             Direction::ServerToClient => 1,
-        }
-    }
-}
-
-/// Cross-direction cancellation signal. When one direction's fault pipeline
-/// decides to close the connection, both forwarding tasks need to stop
-/// promptly (not wait for the peer's socket to eventually error).
-struct Cancel {
-    flag: AtomicBool,
-    notify: Notify,
-}
-
-impl Cancel {
-    fn new() -> Self {
-        Self {
-            flag: AtomicBool::new(false),
-            notify: Notify::new(),
-        }
-    }
-
-    fn cancel(&self) {
-        // Set the flag before waking waiters so anyone racing `cancelled()`
-        // observes the change on their next check.
-        self.flag.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
-    }
-
-    /// Resolves once `cancel()` has been called (past or future).
-    async fn cancelled(&self) {
-        loop {
-            if self.is_cancelled() {
-                return;
-            }
-            // Register interest *before* re-checking the flag to avoid the
-            // classic notify race: producer sets flag, calls notify_waiters,
-            // then we start awaiting and miss the wake.
-            let waiter = self.notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            waiter.await;
         }
     }
 }
@@ -140,7 +95,7 @@ async fn handle_connection(
     let (client_r, client_w) = client.into_split();
     let (server_r, server_w) = server.into_split();
 
-    let cancel = Arc::new(Cancel::new());
+    let cancel = CancellationToken::new();
     let c2s_pipeline = build_pipeline(
         &config.client_to_server,
         config.seed,
@@ -159,8 +114,8 @@ async fn handle_connection(
     let s2c_span =
         info_span!(parent: Span::current(), "dir", side = Direction::ServerToClient.as_str());
 
-    let c2s_cancel = Arc::clone(&cancel);
-    let s2c_cancel = Arc::clone(&cancel);
+    let c2s_cancel = cancel.clone();
+    let s2c_cancel = cancel.clone();
 
     let c2s = tokio::spawn(
         forward(
@@ -247,7 +202,7 @@ async fn forward(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     mut pipeline: FaultPipeline,
-    cancel: Arc<Cancel>,
+    cancel: CancellationToken,
     dir: Direction,
 ) -> Result<ForwardOutput> {
     let mut buf = vec![0u8; BUFFER_SIZE];
