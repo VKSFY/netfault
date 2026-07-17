@@ -17,6 +17,9 @@ pub struct Outcome {
     pub dropped: bool,
     /// Whether the corrupt fault fired on this chunk.
     pub corrupted: bool,
+    /// Whether a nonzero latency was applied to this chunk (i.e. `latency_ms`
+    /// or the sampled jitter produced a nonzero sleep).
+    pub latency_applied: bool,
 }
 
 /// Running counters for fault events on a single stream (one direction of one
@@ -60,7 +63,8 @@ impl FaultPipeline {
     /// Apply the pipeline to a single chunk. Awaits the latency step.
     pub async fn process(&mut self, chunk: Vec<u8>) -> Outcome {
         let sleep = self.compute_latency();
-        if !sleep.is_zero() {
+        let latency_applied = !sleep.is_zero();
+        if latency_applied {
             self.stats.latency_events += 1;
             tokio::time::sleep(sleep).await;
         }
@@ -86,6 +90,7 @@ impl FaultPipeline {
             close_after,
             dropped,
             corrupted,
+            latency_applied,
         }
     }
 

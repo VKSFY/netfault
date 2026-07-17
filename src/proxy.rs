@@ -1,17 +1,24 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, info_span, warn, Instrument, Span};
 
 use crate::config::{Config, FaultConfig};
 use crate::fault::{derive_seed, FaultPipeline, InjectionStats};
+use crate::stats::{DirectionStats, Stats};
 
 const BUFFER_SIZE: usize = 8 * 1024;
+
+/// Time to wait for in-flight connections to drain on shutdown before we
+/// give up and let them be aborted.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,44 +44,98 @@ impl Direction {
             Direction::ServerToClient => 1,
         }
     }
+
+    fn stats_for(self, stats: &Stats) -> &DirectionStats {
+        match self {
+            Direction::ClientToServer => &stats.client_to_server,
+            Direction::ServerToClient => &stats.server_to_client,
+        }
+    }
 }
 
-/// Bind to `config.listen`, accept forever, and forward each connection to `config.target`.
-pub async fn run(config: Arc<Config>) -> Result<()> {
+/// Bind to `config.listen`, accept forever, and forward each connection to
+/// `config.target`. Runs until `shutdown` is cancelled; then waits (up to
+/// `SHUTDOWN_DRAIN_TIMEOUT`) for in-flight connections to finish.
+pub async fn run(
+    config: Arc<Config>,
+    stats: Arc<Stats>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to bind listener on {}", config.listen))?;
     info!(listen = %config.listen, target = %config.target, "netfault proxy listening");
-    serve(listener, config).await
+    serve(listener, config, stats, shutdown).await
 }
 
 /// Serve on an already-bound listener. Split out from `run` so callers that
 /// need atomic port acquisition (integration tests using `127.0.0.1:0`,
 /// systemd socket activation, etc.) can bind themselves and hand the socket in.
-pub async fn serve(listener: TcpListener, config: Arc<Config>) -> Result<()> {
-    loop {
-        let (client, client_addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(err) => {
-                // Accept errors are typically transient (e.g. EMFILE). Log and continue
-                // rather than bringing down the whole proxy.
-                warn!(error = %err, "accept() failed; continuing");
-                continue;
-            }
-        };
+pub async fn serve(
+    listener: TcpListener,
+    config: Arc<Config>,
+    stats: Arc<Stats>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let tracker = TaskTracker::new();
 
-        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let span = info_span!("conn", id = id, client = %client_addr);
-        let conn_config = Arc::clone(&config);
-        tokio::spawn(
-            async move {
-                if let Err(err) = handle_connection(id, client, client_addr, conn_config).await {
-                    warn!(error = %format!("{err:#}"), "connection ended with error");
-                }
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("shutdown requested; no longer accepting new connections");
+                break;
             }
-            .instrument(span),
-        );
+            accept = listener.accept() => {
+                let (client, client_addr) = match accept {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        // Accept errors are typically transient (e.g. EMFILE). Log and continue
+                        // rather than bringing down the whole proxy.
+                        warn!(error = %err, "accept() failed; continuing");
+                        continue;
+                    }
+                };
+
+                let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                stats.connections_handled.fetch_add(1, Ordering::Relaxed);
+                let span = info_span!("conn", id = id, client = %client_addr);
+                let conn_config = Arc::clone(&config);
+                let conn_stats = Arc::clone(&stats);
+                // Child of the global shutdown token: fault-close inside the
+                // connection stays local (only cancels this connection), but a
+                // global Ctrl+C fires all children at once.
+                let conn_shutdown = shutdown.child_token();
+
+                tracker.spawn(
+                    async move {
+                        if let Err(err) = handle_connection(
+                            id,
+                            client,
+                            client_addr,
+                            conn_config,
+                            conn_stats,
+                            conn_shutdown,
+                        )
+                        .await
+                        {
+                            warn!(error = %format!("{err:#}"), "connection ended with error");
+                        }
+                    }
+                    .instrument(span),
+                );
+            }
+        }
     }
+
+    tracker.close();
+    match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, tracker.wait()).await {
+        Ok(()) => info!("all in-flight connections drained"),
+        Err(_) => warn!(
+            "drain timed out after {:?}; some connections were aborted",
+            SHUTDOWN_DRAIN_TIMEOUT
+        ),
+    }
+    Ok(())
 }
 
 async fn handle_connection(
@@ -82,6 +143,8 @@ async fn handle_connection(
     client: TcpStream,
     client_addr: SocketAddr,
     config: Arc<Config>,
+    stats: Arc<Stats>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let target = config.target;
     info!(%client_addr, %target, "connection opened");
@@ -101,7 +164,6 @@ async fn handle_connection(
     let (client_r, client_w) = client.into_split();
     let (server_r, server_w) = server.into_split();
 
-    let cancel = CancellationToken::new();
     let c2s_pipeline = build_pipeline(
         &config.client_to_server,
         config.seed,
@@ -122,6 +184,8 @@ async fn handle_connection(
 
     let c2s_cancel = cancel.clone();
     let s2c_cancel = cancel.clone();
+    let c2s_stats = Arc::clone(&stats);
+    let s2c_stats = Arc::clone(&stats);
 
     let c2s = tokio::spawn(
         forward(
@@ -129,6 +193,7 @@ async fn handle_connection(
             server_w,
             c2s_pipeline,
             c2s_cancel,
+            c2s_stats,
             Direction::ClientToServer,
         )
         .instrument(c2s_span),
@@ -139,6 +204,7 @@ async fn handle_connection(
             client_w,
             s2c_pipeline,
             s2c_cancel,
+            s2c_stats,
             Direction::ServerToClient,
         )
         .instrument(s2c_span),
@@ -202,15 +268,18 @@ fn collect_forward_result(
 
 /// Read from `reader`, run each chunk through `pipeline`, and write the result
 /// to `writer`. Terminates on EOF, I/O error, `pipeline` requesting close, or
-/// `cancel` firing (which typically means the other direction's pipeline asked
-/// to close and we should tear down the whole connection).
+/// `cancel` firing (which can mean either the other direction's pipeline asked
+/// to close, or global shutdown was requested — `cancel` is a child of the
+/// global shutdown token).
 async fn forward(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     mut pipeline: FaultPipeline,
     cancel: CancellationToken,
+    stats: Arc<Stats>,
     dir: Direction,
 ) -> Result<ForwardOutput> {
+    let dir_stats = dir.stats_for(&stats);
     let mut buf = vec![0u8; BUFFER_SIZE];
     let mut total: u64 = 0;
     let mut closed_by_fault = false;
@@ -219,7 +288,7 @@ async fn forward(
         let n = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                debug!(dir = dir.as_str(), "cancelled by peer direction");
+                debug!(dir = dir.as_str(), "cancelled");
                 break;
             }
             r = reader.read(&mut buf) => match r {
@@ -236,6 +305,21 @@ async fn forward(
         let chunk = buf[..n].to_vec();
         let outcome = pipeline.process(chunk).await;
 
+        // Live per-chunk update so shutdown that aborts mid-flight still has
+        // accurate stats for everything processed up to that point.
+        if outcome.latency_applied {
+            dir_stats.latency_events.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.dropped {
+            dir_stats.chunks_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.corrupted {
+            dir_stats.chunks_corrupted.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.close_after {
+            dir_stats.close_fault_fired.fetch_add(1, Ordering::Relaxed);
+        }
+
         if let Some(payload) = outcome.payload {
             if let Err(err) = writer.write_all(&payload).await {
                 return Err(
@@ -243,6 +327,9 @@ async fn forward(
                 );
             }
             total += payload.len() as u64;
+            dir_stats
+                .bytes_forwarded
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
         }
 
         if outcome.close_after {

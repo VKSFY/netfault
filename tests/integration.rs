@@ -12,9 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+use tokio_util::sync::CancellationToken;
+
 use netfault::config::{Config, FaultConfig};
 use netfault::fault::probability_tolerance;
 use netfault::proxy;
+use netfault::stats::Stats;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -56,15 +59,34 @@ async fn spawn_echo_server() -> (SocketAddr, JoinHandle<()>) {
 }
 
 /// Bind a proxy on `127.0.0.1:0`, overwriting `config.listen` with the actual
-/// address. Returns the address and a handle to the accept loop.
-async fn spawn_proxy(mut config: Config) -> (SocketAddr, JoinHandle<()>) {
+/// address. Returns the address, a handle to the accept loop, a shared
+/// `Stats` for tests that want to inspect counters, and a shutdown token.
+async fn spawn_proxy(mut config: Config) -> ProxyHarness {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
     let addr = listener.local_addr().expect("proxy local_addr");
     config.listen = addr;
-    let handle = tokio::spawn(async move {
-        let _ = proxy::serve(listener, Arc::new(config)).await;
-    });
-    (addr, handle)
+    let stats = Arc::new(Stats::default());
+    let shutdown = CancellationToken::new();
+    let handle = {
+        let stats = Arc::clone(&stats);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = proxy::serve(listener, Arc::new(config), stats, shutdown).await;
+        })
+    };
+    ProxyHarness {
+        addr,
+        handle,
+        stats,
+        shutdown,
+    }
+}
+
+struct ProxyHarness {
+    addr: SocketAddr,
+    handle: JoinHandle<()>,
+    stats: Arc<Stats>,
+    shutdown: CancellationToken,
 }
 
 fn base_config(target: SocketAddr, seed: u64) -> Config {
@@ -116,7 +138,8 @@ async fn drop_all_client_to_server_delivers_zero_bytes() {
     let (echo_addr, _echo) = spawn_echo_server().await;
     let mut cfg = base_config(echo_addr, 1);
     cfg.client_to_server.drop_probability = 1.0;
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     let mut client = connect_nodelay(proxy_addr).await;
     client
@@ -142,7 +165,8 @@ async fn latency_c2s_adds_measurable_rtt() {
     let (echo_addr, _echo) = spawn_echo_server().await;
     let mut cfg = base_config(echo_addr, 1);
     cfg.client_to_server.latency_ms = 200;
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     let mut client = connect_nodelay(proxy_addr).await;
     let payload = b"ping";
@@ -174,7 +198,8 @@ async fn corrupt_flips_exactly_n_distinct_bits() {
     let mut cfg = base_config(echo_addr, 1);
     cfg.client_to_server.corrupt_probability = 1.0;
     cfg.client_to_server.corrupt_bits = 3;
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     let mut client = connect_nodelay(proxy_addr).await;
     // 512 bytes: comfortably under Ethernet MSS (~1460), so this write is a
@@ -202,7 +227,8 @@ async fn close_probability_1_terminates_connection() {
     let (echo_addr, _echo) = spawn_echo_server().await;
     let mut cfg = base_config(echo_addr, 1);
     cfg.client_to_server.close_probability = 1.0;
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     let mut client = connect_nodelay(proxy_addr).await;
     client.write_all(b"hello").await.expect("client write");
@@ -232,7 +258,8 @@ async fn concurrent_connections_each_hit_target_drop_rate() {
     let (echo_addr, _echo) = spawn_echo_server().await;
     let mut cfg = base_config(echo_addr, 0xC0DE_C0DE);
     cfg.client_to_server.drop_probability = P;
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     // Kernel-level coalescing means the pipeline may see fewer than
     // MSGS_PER_CLIENT reads even with NODELAY + inter-send sleep. Widen the
@@ -289,7 +316,8 @@ async fn all_four_faults_combined_do_not_deadlock() {
         corrupt_bits: 1,
         close_probability: 0.01,
     };
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     let mut client = connect_nodelay(proxy_addr).await;
 
@@ -346,7 +374,8 @@ async fn half_close_propagates_through_latency_pipeline() {
     cfg.client_to_server.latency_ms = 50;
     cfg.server_to_client.latency_ms = 50;
     // Drop / corrupt / close all zero: only the timing path is exercised.
-    let (proxy_addr, _proxy) = spawn_proxy(cfg).await;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
 
     let mut client = connect_nodelay(proxy_addr).await;
     let payload: Vec<u8> = (0..2048).map(|i| (i & 0xFF) as u8).collect();
@@ -363,4 +392,65 @@ async fn half_close_propagates_through_latency_pipeline() {
         payload.len(),
         got.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Graceful shutdown: stats accumulate across connections, shutdown token
+//    stops the accept loop, and in-flight connections drain cleanly
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shutdown_drains_and_accumulates_correct_stats() {
+    let (echo_addr, _echo) = spawn_echo_server().await;
+    let mut cfg = base_config(echo_addr, 1);
+    // Small latency on c2s so per-chunk latency events are observable.
+    cfg.client_to_server.latency_ms = 5;
+    let proxy = spawn_proxy(cfg).await;
+    let proxy_addr = proxy.addr;
+
+    // Run three sequential connections, each round-tripping a 256-byte payload.
+    const N_CONNS: usize = 3;
+    const PAYLOAD_LEN: usize = 256;
+    for _ in 0..N_CONNS {
+        let mut client = connect_nodelay(proxy_addr).await;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
+        client.write_all(&payload).await.expect("client write");
+        client.shutdown().await.expect("client shutdown");
+        let got = read_until_eof(&mut client, Duration::from_secs(3)).await;
+        assert_eq!(got.len(), payload.len(), "round-trip length");
+    }
+
+    // Now trigger graceful shutdown. The accept loop should return, and the
+    // proxy task's JoinHandle should complete within the drain window.
+    proxy.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), proxy.handle)
+        .await
+        .expect("proxy shutdown timed out")
+        .expect("proxy task join");
+
+    let snap = proxy.stats.snapshot();
+    assert_eq!(
+        snap.connections_handled, N_CONNS as u64,
+        "expected {N_CONNS} connections accounted for"
+    );
+    assert_eq!(
+        snap.client_to_server.bytes_forwarded,
+        (N_CONNS * PAYLOAD_LEN) as u64,
+        "c2s bytes",
+    );
+    assert_eq!(
+        snap.server_to_client.bytes_forwarded,
+        (N_CONNS * PAYLOAD_LEN) as u64,
+        "s2c bytes",
+    );
+    // Each of the N connections has at least one c2s chunk with 5ms latency.
+    assert!(
+        snap.client_to_server.latency_events >= N_CONNS as u64,
+        "expected at least {N_CONNS} latency events, got {}",
+        snap.client_to_server.latency_events,
+    );
+    // No fault probabilities configured beyond latency -> no drops/corrupts/closes.
+    assert_eq!(snap.client_to_server.chunks_dropped, 0);
+    assert_eq!(snap.client_to_server.chunks_corrupted, 0);
+    assert_eq!(snap.client_to_server.close_fault_fired, 0);
 }
