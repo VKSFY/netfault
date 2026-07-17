@@ -285,4 +285,181 @@ mod tests {
             assert_eq!(o1.payload, o2.payload);
         }
     }
+
+    // --- Statistical tests ---------------------------------------------------
+    //
+    // Each of the four faults has a probability parameter that promises "over N
+    // trials, roughly N*p events fire". These tests verify that promise. All
+    // trials use a fixed seed, so the observed rate is deterministic and the
+    // test cannot become flaky across runs — the tolerance below only exists
+    // to remain robust against small refactors that shift the RNG sequence.
+
+    const N_TRIALS: usize = 10_000;
+
+    /// 4-sigma binomial confidence bound on the observed rate, floored at 0.005
+    /// to give a comfortable margin even at extreme `p`.
+    fn tolerance(p: f64, n: usize) -> f64 {
+        let sigma = (p * (1.0 - p) / n as f64).sqrt();
+        (4.0 * sigma).max(0.005)
+    }
+
+    fn assert_rate_close(fault: &str, p: f64, observed: f64) {
+        let tol = tolerance(p, N_TRIALS);
+        assert!(
+            (observed - p).abs() < tol,
+            "{fault}: expected rate ~{p:.3} (tol {tol:.4}) over {N_TRIALS} trials, observed {observed:.4}"
+        );
+    }
+
+    /// Run `N_TRIALS` chunks through a fresh pipeline and return the fraction
+    /// of chunks for which `predicate(&outcome)` is true.
+    async fn observed_rate<F>(cfg: FaultConfig, seed: u64, mut predicate: F) -> f64
+    where
+        F: FnMut(&Outcome) -> bool,
+    {
+        let mut pipe = FaultPipeline::new(cfg, seed);
+        let mut hits = 0usize;
+        for _ in 0..N_TRIALS {
+            let out = pipe.process(vec![0x55u8; 8]).await;
+            if predicate(&out) {
+                hits += 1;
+            }
+        }
+        hits as f64 / N_TRIALS as f64
+    }
+
+    #[tokio::test]
+    async fn drop_rate_matches_probability() {
+        for p in [0.1_f64, 0.3, 0.5, 0.75] {
+            let cfg = FaultConfig {
+                drop_probability: p,
+                ..Default::default()
+            };
+            let rate = observed_rate(cfg, 0xDEAD_BEEF, |o| o.dropped).await;
+            assert_rate_close("drop", p, rate);
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_rate_matches_probability() {
+        for p in [0.1_f64, 0.3, 0.5, 0.75] {
+            let cfg = FaultConfig {
+                corrupt_probability: p,
+                corrupt_bits: 2,
+                ..Default::default()
+            };
+            let rate = observed_rate(cfg, 0xC0FF_EE00, |o| o.corrupted).await;
+            assert_rate_close("corrupt", p, rate);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_rate_matches_probability() {
+        // close_after is per-chunk. We measure its per-chunk fire rate the same
+        // way as the other faults — a fresh pipeline per probability so the
+        // trials aren't cut short by the first close firing.
+        for p in [0.1_f64, 0.3, 0.5, 0.75] {
+            let cfg = FaultConfig {
+                close_probability: p,
+                ..Default::default()
+            };
+            let rate = observed_rate(cfg, 0xFACE_D00D, |o| o.close_after).await;
+            assert_rate_close("close", p, rate);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn latency_mean_matches_expected() {
+        // Under paused time, tokio::time::sleep advances virtual time
+        // instantly, so N_TRIALS trials complete in real-time milliseconds
+        // while the *simulated* total equals the sum of every sleep.
+        //
+        // With latency_ms=100 and jitter_ms=40 sampled uniformly from
+        // {0, 1, ..., 40}, expected mean per chunk = 100 + 20 = 120 ms.
+        let cfg = FaultConfig {
+            latency_ms: 100,
+            latency_jitter_ms: 40,
+            ..Default::default()
+        };
+        let mut pipe = FaultPipeline::new(cfg, 0xBADD_CAFE);
+
+        let start = tokio::time::Instant::now();
+        for _ in 0..N_TRIALS {
+            pipe.process(vec![0x00u8; 4]).await;
+        }
+        let mean_ms = start.elapsed().as_micros() as f64 / (N_TRIALS as f64 * 1000.0);
+
+        // Uniform{0..=40} has variance = (41^2 - 1) / 12 ≈ 140. Std of the
+        // sample mean over N_TRIALS = sqrt(140/10000) ≈ 0.118 ms. 5-sigma
+        // bound ≈ 0.6 ms; we allow 1 ms as a comfortable margin.
+        let expected = 120.0;
+        let tol_ms = 1.0;
+        assert!(
+            (mean_ms - expected).abs() < tol_ms,
+            "expected mean latency ~{expected} ms (tol {tol_ms}), observed {mean_ms:.4}",
+        );
+        assert_eq!(pipe.stats().latency_events as usize, N_TRIALS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn latency_jitter_range_is_respected() {
+        // Every sampled sleep must fall in [latency_ms, latency_ms + jitter_ms].
+        // Sample many delays via paused-time deltas.
+        let cfg = FaultConfig {
+            latency_ms: 50,
+            latency_jitter_ms: 30,
+            ..Default::default()
+        };
+        let mut pipe = FaultPipeline::new(cfg, 0xBEEF_CAFE);
+
+        let mut min_ms = u128::MAX;
+        let mut max_ms = 0u128;
+        for _ in 0..1_000 {
+            let t0 = tokio::time::Instant::now();
+            pipe.process(vec![0x00u8; 4]).await;
+            let d = t0.elapsed().as_millis();
+            min_ms = min_ms.min(d);
+            max_ms = max_ms.max(d);
+        }
+        assert!(min_ms >= 50, "observed min {min_ms} ms < base 50 ms");
+        assert!(max_ms <= 80, "observed max {max_ms} ms > base+jitter 80 ms");
+        // With 1000 draws over 31 possible values, we expect to touch both
+        // endpoints. Assert we saw the low end and the high end (or close):
+        assert!(
+            min_ms <= 52,
+            "min {min_ms} ms — RNG didn't hit near the bottom of the jitter range"
+        );
+        assert!(
+            max_ms >= 78,
+            "max {max_ms} ms — RNG didn't hit near the top of the jitter range"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_and_corrupt_never_co_occur_on_same_chunk() {
+        // Pipeline order guarantee: `drop` runs before `corrupt`, so a chunk
+        // that was dropped is never also corrupted. Verify over many trials
+        // with both probabilities high enough to co-occur frequently if the
+        // ordering were broken.
+        let cfg = FaultConfig {
+            drop_probability: 0.5,
+            corrupt_probability: 0.5,
+            corrupt_bits: 1,
+            ..Default::default()
+        };
+        let mut pipe = FaultPipeline::new(cfg, 0x1234_5678);
+        for _ in 0..N_TRIALS {
+            let out = pipe.process(vec![0x00u8; 8]).await;
+            assert!(
+                !(out.dropped && out.corrupted),
+                "dropped and corrupted both true on same chunk"
+            );
+            // Also: if dropped, payload must be None. If not dropped, Some.
+            assert_eq!(out.dropped, out.payload.is_none());
+        }
+        // The two counters should each be roughly N/2, and their sum should
+        // never exceed N (they partition the "processed" set).
+        let s = pipe.stats();
+        assert!(s.dropped + s.corrupted <= N_TRIALS as u64);
+    }
 }
