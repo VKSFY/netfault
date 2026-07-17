@@ -46,6 +46,11 @@ is the shutdown signal for Ctrl+C; each connection gets a `child_token()`,
 so a fault-close inside one connection tears down only that connection while
 Ctrl+C tears down all of them.
 
+I didn't use `tokio::io::copy_bidirectional` for the forwarding. The fault
+pipeline needs to sit between the read and the write on every chunk, and
+`copy_bidirectional` hides that seam. Each direction is its own task doing
+an explicit `read → pipeline → write` loop instead.
+
 ### Fault pipeline (per chunk, per direction)
 
 Every chunk read from the wire runs through this pipeline before it's written
@@ -240,30 +245,26 @@ and a real proxy on ephemeral ports.
 
 ## Known limitations
 
-`netfault` is a fault-injection tool for development and staging, not a
-production data-plane. The fault pipeline is the focus; the proxy layer
-around it is deliberately minimal.
+This is a dev/staging tool. The fault pipeline is the point; the proxy
+scaffolding around it is deliberately minimal.
 
-- **No TLS termination or inspection.** `netfault` is a byte proxy. TLS
-  handshakes will flow through it untouched, but any injected corruption
-  or drops will kill the TLS session at the first bad record. That may
-  be exactly what you want (verifying that TLS integrity checks catch
-  tampering) but it's not TLS-aware in any deeper sense.
-- **No connection limits or backpressure.** There's no `max_connections`
-  ceiling, no per-connection buffer cap, and the accept loop will spawn
-  a task for every incoming socket. A misconfigured client hammering
-  the proxy can OOM it.
-- **Per-chunk allocation.** Each read is copied into a fresh `Vec<u8>`
-  before entering the fault pipeline so the pipeline can mutate it in
-  place. Fine for chaos-testing throughput; not fine as a general-purpose
-  L4 load balancer.
-- **Not production-hardened.** No authentication, no config reload, no
-  Prometheus/OTel export (only a stdout summary + `tracing` logs), no
-  clustering, no multi-target routing.
-- **Ctrl+C shutdown has a fixed 5s drain timeout.** In-flight connections
-  that don't finish in that window are aborted. Their partial stats are
-  still counted (the counters update per chunk, not per connection close),
-  but the sockets are dropped mid-conversation.
+TLS isn't handled specially — handshakes flow through as bytes, and any
+injected drop or corruption kills the session at the first bad record.
+
+No `max_connections` cap, no per-connection buffer cap, no backpressure.
+The accept loop happily spawns a task per socket, so a pathological
+client can OOM the process.
+
+Per-chunk allocation: each read is copied into a fresh `Vec<u8>` so the
+pipeline can mutate in place. Fine here; wouldn't fly as an L4 balancer.
+
+No auth. No config reload. No Prometheus or OTel export — a stdout
+summary plus `tracing` logs is what you get. No clustering, no
+multi-target routing.
+
+The Ctrl+C drain window is hardcoded to 5s. Anything still in flight
+after that gets aborted, though its partial stats are already in the
+counters — those update per chunk, not per connection close.
 
 ## License
 
