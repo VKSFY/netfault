@@ -45,7 +45,13 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind listener on {}", config.listen))?;
     info!(listen = %config.listen, target = %config.target, "netfault proxy listening");
+    serve(listener, config).await
+}
 
+/// Serve on an already-bound listener. Split out from `run` so callers that
+/// need atomic port acquisition (integration tests using `127.0.0.1:0`,
+/// systemd socket activation, etc.) can bind themselves and hand the socket in.
+pub async fn serve(listener: TcpListener, config: Arc<Config>) -> Result<()> {
     loop {
         let (client, client_addr) = match listener.accept().await {
             Ok(pair) => pair,

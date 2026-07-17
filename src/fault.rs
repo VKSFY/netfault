@@ -121,12 +121,27 @@ impl FaultPipeline {
             return chunk;
         }
         let bits_to_flip = (self.config.corrupt_bits as usize).min(total_bits);
-        for _ in 0..bits_to_flip {
-            let bit_idx = self.rng.gen_range(0..total_bits);
+        // Sample without replacement so `corrupt_bits = k` produces exactly k
+        // distinct bit flips (Hamming distance = k). With the previous
+        // with-replacement sampler, two draws hitting the same position would
+        // cancel and silently reduce the effective distance.
+        let indices = rand::seq::index::sample(&mut self.rng, total_bits, bits_to_flip);
+        for bit_idx in indices {
             chunk[bit_idx / 8] ^= 1u8 << (bit_idx % 8);
         }
         chunk
     }
+}
+
+/// 4-sigma binomial confidence bound on the observed rate for an event with
+/// probability `p` over `n` independent trials. Floored at 0.005 so extreme
+/// `p` values still leave a usable margin.
+///
+/// Exposed so integration tests can apply the same tolerance as the M4 unit
+/// tests when asserting on observed fault rates end-to-end.
+pub fn probability_tolerance(p: f64, n: usize) -> f64 {
+    let sigma = (p * (1.0 - p) / n as f64).sqrt();
+    (4.0 * sigma).max(0.005)
 }
 
 /// Derive a per-connection, per-direction seed from a master seed + connection id.
@@ -296,15 +311,8 @@ mod tests {
 
     const N_TRIALS: usize = 10_000;
 
-    /// 4-sigma binomial confidence bound on the observed rate, floored at 0.005
-    /// to give a comfortable margin even at extreme `p`.
-    fn tolerance(p: f64, n: usize) -> f64 {
-        let sigma = (p * (1.0 - p) / n as f64).sqrt();
-        (4.0 * sigma).max(0.005)
-    }
-
     fn assert_rate_close(fault: &str, p: f64, observed: f64) {
-        let tol = tolerance(p, N_TRIALS);
+        let tol = probability_tolerance(p, N_TRIALS);
         assert!(
             (observed - p).abs() < tol,
             "{fault}: expected rate ~{p:.3} (tol {tol:.4}) over {N_TRIALS} trials, observed {observed:.4}"
