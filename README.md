@@ -10,17 +10,19 @@ reproducible way to see how your code handles the resulting chaos.
 
 ## Why
 
-Distributed systems have to be robust against unreliable networks, but
-production rarely misbehaves on demand. Mocking failures at the application
-layer misses real transport-level behavior: partial writes, half-open
-sockets, packet-boundary corruption, mid-stream disconnects. `netfault`
-lets you provoke those failures deterministically:
+Mocking network failures at the application layer misses everything
+interesting about how a network actually breaks: partial writes, half-open
+sockets, corruption at arbitrary byte boundaries, mid-stream disconnects.
+Injecting the faults at the TCP level surfaces the code paths that
+app-layer mocks don't — the retry loop that hammers a dying downstream,
+the timeout that never actually fires, the checksum that happily accepts
+a mangled frame.
 
-- Verify RPC clients honor their timeouts under injected latency.
-- Confirm retry logic doesn't hammer a downstream when connections keep dying.
-- Check that integrity paths (checksums, TLS record MACs) actually catch
-  corrupted bytes.
-- Reproduce a specific chaos scenario bit-for-bit by pinning the PRNG seed.
+Pin the seed and any run reproduces bit-for-bit.
+
+I built this mainly to work through TCP-level networking and async Rust
+end-to-end — sockets, backpressure, cancellation — rather than something
+I'd only read about.
 
 ## Architecture
 
