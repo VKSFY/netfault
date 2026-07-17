@@ -1,13 +1,15 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tracing::{debug, error, info, info_span, warn, Instrument, Span};
 
-use crate::config::Config;
+use crate::config::{Config, FaultConfig};
+use crate::fault::{derive_seed, FaultPipeline, InjectionStats};
 
 const BUFFER_SIZE: usize = 8 * 1024;
 
@@ -25,6 +27,59 @@ impl Direction {
         match self {
             Direction::ClientToServer => "c2s",
             Direction::ServerToClient => "s2c",
+        }
+    }
+
+    /// Stable tag used to seed the per-direction RNG.
+    fn seed_tag(self) -> u64 {
+        match self {
+            Direction::ClientToServer => 0,
+            Direction::ServerToClient => 1,
+        }
+    }
+}
+
+/// Cross-direction cancellation signal. When one direction's fault pipeline
+/// decides to close the connection, both forwarding tasks need to stop
+/// promptly (not wait for the peer's socket to eventually error).
+struct Cancel {
+    flag: AtomicBool,
+    notify: Notify,
+}
+
+impl Cancel {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        // Set the flag before waking waiters so anyone racing `cancelled()`
+        // observes the change on their next check.
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once `cancel()` has been called (past or future).
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            // Register interest *before* re-checking the flag to avoid the
+            // classic notify race: producer sets flag, calls notify_waiters,
+            // then we start awaiting and miss the wake.
+            let waiter = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            waiter.await;
         }
     }
 }
@@ -52,7 +107,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         let conn_config = Arc::clone(&config);
         tokio::spawn(
             async move {
-                if let Err(err) = handle_connection(client, client_addr, conn_config).await {
+                if let Err(err) = handle_connection(id, client, client_addr, conn_config).await {
                     warn!(error = %format!("{err:#}"), "connection ended with error");
                 }
             }
@@ -62,6 +117,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
 }
 
 async fn handle_connection(
+    conn_id: u64,
     client: TcpStream,
     client_addr: SocketAddr,
     config: Arc<Config>,
@@ -69,9 +125,7 @@ async fn handle_connection(
     let target = config.target;
     info!(%client_addr, %target, "connection opened");
 
-    // Disable Nagle on the client side so small chunks flush promptly. This makes
-    // observed fault-injection behavior (latency, drops) match the config more
-    // closely under low-throughput workloads.
+    // Disable Nagle on both sides so small fault-injected chunks flush promptly.
     if let Err(err) = client.set_nodelay(true) {
         debug!(error = %err, "set_nodelay(client) failed; continuing");
     }
@@ -86,76 +140,171 @@ async fn handle_connection(
     let (client_r, client_w) = client.into_split();
     let (server_r, server_w) = server.into_split();
 
+    let cancel = Arc::new(Cancel::new());
+    let c2s_pipeline = build_pipeline(
+        &config.client_to_server,
+        config.seed,
+        conn_id,
+        Direction::ClientToServer,
+    );
+    let s2c_pipeline = build_pipeline(
+        &config.server_to_client,
+        config.seed,
+        conn_id,
+        Direction::ServerToClient,
+    );
+
     let c2s_span =
         info_span!(parent: Span::current(), "dir", side = Direction::ClientToServer.as_str());
     let s2c_span =
         info_span!(parent: Span::current(), "dir", side = Direction::ServerToClient.as_str());
 
-    let c2s =
-        tokio::spawn(forward(client_r, server_w, Direction::ClientToServer).instrument(c2s_span));
-    let s2c =
-        tokio::spawn(forward(server_r, client_w, Direction::ServerToClient).instrument(s2c_span));
+    let c2s_cancel = Arc::clone(&cancel);
+    let s2c_cancel = Arc::clone(&cancel);
 
-    // Wait for both directions to complete. If one side errors, log it but keep
-    // waiting on the other so we still report accurate byte counts.
-    let c2s_bytes = match c2s.await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(err)) => {
-            warn!(dir = "c2s", error = %format!("{err:#}"), "forward task errored");
-            0
-        }
-        Err(join_err) => {
-            error!(dir = "c2s", error = %join_err, "forward task panicked");
-            0
-        }
-    };
-    let s2c_bytes = match s2c.await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(err)) => {
-            warn!(dir = "s2c", error = %format!("{err:#}"), "forward task errored");
-            0
-        }
-        Err(join_err) => {
-            error!(dir = "s2c", error = %join_err, "forward task panicked");
-            0
-        }
-    };
+    let c2s = tokio::spawn(
+        forward(
+            client_r,
+            server_w,
+            c2s_pipeline,
+            c2s_cancel,
+            Direction::ClientToServer,
+        )
+        .instrument(c2s_span),
+    );
+    let s2c = tokio::spawn(
+        forward(
+            server_r,
+            client_w,
+            s2c_pipeline,
+            s2c_cancel,
+            Direction::ServerToClient,
+        )
+        .instrument(s2c_span),
+    );
 
-    info!(c2s_bytes, s2c_bytes, "connection closed");
+    let c2s_out = collect_forward_result("c2s", c2s.await);
+    let s2c_out = collect_forward_result("s2c", s2c.await);
+
+    info!(
+        c2s_bytes = c2s_out.bytes,
+        s2c_bytes = s2c_out.bytes,
+        c2s_dropped = c2s_out.stats.dropped,
+        s2c_dropped = s2c_out.stats.dropped,
+        c2s_corrupted = c2s_out.stats.corrupted,
+        s2c_corrupted = s2c_out.stats.corrupted,
+        c2s_latency_events = c2s_out.stats.latency_events,
+        s2c_latency_events = s2c_out.stats.latency_events,
+        closed_by_fault = c2s_out.stats.closed + s2c_out.stats.closed > 0,
+        "connection closed"
+    );
     Ok(())
 }
 
-/// Copy bytes from `reader` to `writer` a chunk at a time. Returns total bytes forwarded.
-///
-/// Reads are chunked (not `tokio::io::copy_bidirectional`) so that later milestones
-/// can insert fault-injection logic between the read and the write on each chunk.
+fn build_pipeline(
+    cfg: &FaultConfig,
+    master_seed: u64,
+    conn_id: u64,
+    dir: Direction,
+) -> FaultPipeline {
+    let seed = derive_seed(master_seed, conn_id, dir.seed_tag());
+    FaultPipeline::new(cfg.clone(), seed)
+}
+
+struct ForwardOutput {
+    bytes: u64,
+    stats: InjectionStats,
+}
+
+fn collect_forward_result(
+    dir: &'static str,
+    joined: Result<Result<ForwardOutput>, tokio::task::JoinError>,
+) -> ForwardOutput {
+    match joined {
+        Ok(Ok(out)) => out,
+        Ok(Err(err)) => {
+            warn!(dir, error = %format!("{err:#}"), "forward task errored");
+            ForwardOutput {
+                bytes: 0,
+                stats: InjectionStats::default(),
+            }
+        }
+        Err(join_err) => {
+            error!(dir, error = %join_err, "forward task panicked");
+            ForwardOutput {
+                bytes: 0,
+                stats: InjectionStats::default(),
+            }
+        }
+    }
+}
+
+/// Read from `reader`, run each chunk through `pipeline`, and write the result
+/// to `writer`. Terminates on EOF, I/O error, `pipeline` requesting close, or
+/// `cancel` firing (which typically means the other direction's pipeline asked
+/// to close and we should tear down the whole connection).
 async fn forward(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
+    mut pipeline: FaultPipeline,
+    cancel: Arc<Cancel>,
     dir: Direction,
-) -> Result<u64> {
+) -> Result<ForwardOutput> {
     let mut buf = vec![0u8; BUFFER_SIZE];
     let mut total: u64 = 0;
+    let mut closed_by_fault = false;
+
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(err) => {
+        let n = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!(dir = dir.as_str(), "cancelled by peer direction");
+                break;
+            }
+            r = reader.read(&mut buf) => match r {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::from(err).context(format!("read failed on {}", dir.as_str()))
+                    );
+                }
+            },
+        };
+
+        let chunk = buf[..n].to_vec();
+        let outcome = pipeline.process(chunk).await;
+
+        if let Some(payload) = outcome.payload {
+            if let Err(err) = writer.write_all(&payload).await {
                 return Err(
-                    anyhow::Error::from(err).context(format!("read failed on {}", dir.as_str()))
+                    anyhow::Error::from(err).context(format!("write failed on {}", dir.as_str()))
                 );
             }
-        };
-        if let Err(err) = writer.write_all(&buf[..n]).await {
-            return Err(
-                anyhow::Error::from(err).context(format!("write failed on {}", dir.as_str()))
-            );
+            total += payload.len() as u64;
         }
-        total += n as u64;
+
+        if outcome.close_after {
+            closed_by_fault = true;
+            debug!(dir = dir.as_str(), "close fault fired");
+            cancel.cancel();
+            break;
+        }
     }
-    // Half-close the write side so the peer sees EOF.
+
+    // Half-close the write side so the peer sees EOF. Best-effort — if the
+    // connection is already dead (e.g. fault-close on the other direction just
+    // dropped the socket) the shutdown will error and we log at debug.
     if let Err(err) = writer.shutdown().await {
         debug!(dir = dir.as_str(), error = %err, "shutdown() failed");
     }
-    Ok(total)
+
+    let stats = pipeline.stats();
+    if closed_by_fault {
+        info!(dir = dir.as_str(), "closed by fault");
+    }
+    Ok(ForwardOutput {
+        bytes: total,
+        stats,
+    })
 }
