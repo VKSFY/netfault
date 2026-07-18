@@ -123,6 +123,8 @@ latency_ms = 10
   defaulting).
 - Defaults for every fault field are a benign 0 / 0.0, so a partial
   `[client_to_server]` block is fine.
+- If `corrupt_bits` exceeds the number of bits in a chunk (`chunk.len() * 8`),
+  it's clamped down to that maximum — no error, no wraparound.
 
 An example config lives at [`examples/netfault.toml`](examples/netfault.toml).
 
